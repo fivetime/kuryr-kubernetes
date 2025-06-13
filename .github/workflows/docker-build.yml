@@ -25,6 +25,10 @@ env:
   IMAGE_PREFIX: kuryr-kubernetes
   OWNER: ${{ github.repository_owner }}
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -43,7 +47,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 设置 Docker Buildx
+      - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to Container Registry
@@ -104,7 +108,7 @@ jobs:
     needs: build
     if: always()
     steps:
-      - name: 生成构建总结
+      - name: Generate summary
         run: |
           echo "## Kuryr Kubernetes 镜像构建总结" >> $GITHUB_STEP_SUMMARY
           echo "| 镜像 | 状态 |" >> $GITHUB_STEP_SUMMARY
