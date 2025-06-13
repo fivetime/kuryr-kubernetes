@@ -48,11 +48,9 @@ jobs:
           - image: cni
             dockerfile: cni.Dockerfile
             context: .
-            official_name: kuryr/cni
           - image: controller
             dockerfile: controller.Dockerfile
             context: .
-            official_name: kuryr/controller
 
     steps:
       - name: Checkout
@@ -74,7 +72,6 @@ jobs:
         with:
           images: |
             ${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.IMAGE_PREFIX }}-${{ matrix.image }}
-            ${{ matrix.official_name }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
@@ -194,9 +191,12 @@ jobs:
           echo "- \`${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.IMAGE_PREFIX }}-cni:latest\`" >> $GITHUB_STEP_SUMMARY
           echo "- \`${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.IMAGE_PREFIX }}-controller:latest\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Official Style Tags:**" >> $GITHUB_STEP_SUMMARY
-          echo "- \`kuryr/cni:latest\`" >> $GITHUB_STEP_SUMMARY
-          echo "- \`kuryr/controller:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔧 Local Build Commands" >> $GITHUB_STEP_SUMMARY
+          echo "To build locally with official names:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "docker build -t kuryr/controller -f controller.Dockerfile ." >> $GITHUB_STEP_SUMMARY
+          echo "docker build -t kuryr/cni -f cni.Dockerfile ." >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### ⚙️ Build Parameters" >> $GITHUB_STEP_SUMMARY
           echo "- **Upper Constraints**: \`${{ inputs.upper_constraints_file || 'https://releases.openstack.org/constraints/upper/master' }}\`" >> $GITHUB_STEP_SUMMARY
