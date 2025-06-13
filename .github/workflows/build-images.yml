@@ -6,13 +6,13 @@ on:
     paths:
       - 'cni.Dockerfile'
       - 'controller.Dockerfile'
-      - '.github/workflows/docker-build.yml'
+      - '.github/workflows/build-images.yml'
   pull_request:
     branches: [ main, master ]
     paths:
       - 'cni.Dockerfile'
       - 'controller.Dockerfile'
-      - '.github/workflows/docker-build.yml'
+      - '.github/workflows/build-images.yml'
   workflow_dispatch:
     inputs:
       upper_constraints_file:
@@ -22,8 +22,11 @@ on:
       cni_daemon:
         description: 'Enable CNI daemon mode'
         required: false
-        default: true
-        type: boolean
+        default: 'True'
+        type: choice
+        options:
+          - 'True'
+          - 'False'
 
 env:
   REGISTRY: ghcr.io
@@ -63,7 +66,7 @@ jobs:
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.CR_PAT }}
 
       - name: Extract metadata
         id: meta
@@ -78,6 +81,20 @@ jobs:
             type=ref,event=pr
             type=sha,prefix={{branch}}-
 
+      - name: Prepare build args
+        id: build-args
+        run: |
+          echo "UPPER_CONSTRAINTS_FILE=${{ inputs.upper_constraints_file || 'https://releases.openstack.org/constraints/upper/master' }}" >> $GITHUB_OUTPUT
+          echo "OSLO_LOCK_PATH=/var/kuryr-lock" >> $GITHUB_OUTPUT
+          
+          # 只为 CNI 镜像设置 CNI_DAEMON 参数
+          if [ "${{ matrix.image }}" = "cni" ]; then
+            echo "CNI_DAEMON=${{ inputs.cni_daemon || 'True' }}" >> $GITHUB_OUTPUT
+            echo "EXTRA_ARGS=CNI_DAEMON=${{ inputs.cni_daemon || 'True' }}" >> $GITHUB_OUTPUT
+          else
+            echo "EXTRA_ARGS=" >> $GITHUB_OUTPUT
+          fi
+
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
@@ -87,44 +104,70 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            UPPER_CONSTRAINTS_FILE=${{ inputs.upper_constraints_file }}
-            OSLO_LOCK_PATH=/var/kuryr-lock
-            CNI_DAEMON=${{ matrix.image == 'cni' && (inputs.cni_daemon || 'True') || '' }}
+            UPPER_CONSTRAINTS_FILE=${{ steps.build-args.outputs.UPPER_CONSTRAINTS_FILE }}
+            OSLO_LOCK_PATH=${{ steps.build-args.outputs.OSLO_LOCK_PATH }}
+            ${{ steps.build-args.outputs.EXTRA_ARGS }}
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          platforms: linux/amd64
 
       - name: Test image
         run: |
-          IMAGE="${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.IMAGE_PREFIX }}-${{ matrix.image }}"
+          # 获取主要镜像标签
+          MAIN_IMAGE="${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.IMAGE_PREFIX }}-${{ matrix.image }}"
           
-          # 获取刚构建的镜像标签
-          if [[ "${{ github.ref_name }}" == "main" || "${{ github.ref_name }}" == "master" ]]; then
-            TAG="$IMAGE:latest"
+          # 确定测试标签
+          if [[ "${{ github.event_name }}" == "push" && ("${{ github.ref_name }}" == "main" || "${{ github.ref_name }}" == "master") ]]; then
+            TEST_TAG="$MAIN_IMAGE:latest"
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            TEST_TAG="$MAIN_IMAGE:pr-${{ github.event.number }}"
           else
-            TAG="$IMAGE:${{ github.ref_name }}"
+            TEST_TAG="$MAIN_IMAGE:${{ github.ref_name }}"
           fi
           
-          echo "Testing image: $TAG"
+          echo "Testing image: $TEST_TAG"
           
           # 基础测试 - 验证 Python 环境
-          docker run --rm $TAG python3 --version
+          echo "Verifying Python environment..."
+          docker run --rm $TEST_TAG python3 --version
           
           # 特定组件测试
           if [ "${{ matrix.image }}" = "cni" ]; then
             echo "Testing CNI component..."
+          
             # 测试 CNI 二进制文件
-            docker run --rm $TAG ls -la /kuryr-cni
+            echo "Checking CNI binary..."
+            docker run --rm $TEST_TAG ls -la /kuryr-cni
+          
             # 测试配置目录
-            docker run --rm $TAG ls -la /etc/kuryr-cni
+            echo "Checking config directory..."
+            docker run --rm $TEST_TAG ls -la /etc/kuryr-cni
+          
             # 测试初始化脚本
-            docker run --rm $TAG which cni_ds_init
+            echo "Checking init script..."
+            docker run --rm $TEST_TAG which cni_ds_init
+          
+            # 测试环境变量
+            echo "Checking environment variables..."
+            docker run --rm $TEST_TAG printenv | grep -E "(CNI_DAEMON|OSLO_LOCK_PATH)"
+          
           elif [ "${{ matrix.image }}" = "controller" ]; then
             echo "Testing Controller component..."
-            # 测试控制器命令
-            docker run --rm $TAG kuryr-k8s-controller --help | head -10
+          
+            # 测试控制器帮助信息
+            echo "Checking controller command..."
+            docker run --rm $TEST_TAG kuryr-k8s-controller --help | head -10
+          
             # 验证 kuryr 用户
-            docker run --rm $TAG id kuryr
+            echo "Checking kuryr user..."
+            docker run --rm $TEST_TAG id kuryr
+          
+            # 检查 Python 包安装
+            echo "Checking Python packages..."
+            docker run --rm $TEST_TAG python3 -c "import kuryr_kubernetes; print('Kuryr Kubernetes imported successfully')"
           fi
+          
+          echo "✅ Image ${{ matrix.image }} test passed"
 
   summary:
     runs-on: ubuntu-latest
@@ -156,8 +199,8 @@ jobs:
           echo "- \`kuryr/controller:latest\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### ⚙️ Build Parameters" >> $GITHUB_STEP_SUMMARY
-          echo "- **Upper Constraints**: \`${{ inputs.upper_constraints_file }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **CNI Daemon Mode**: \`${{ inputs.cni_daemon || 'true' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Upper Constraints**: \`${{ inputs.upper_constraints_file || 'https://releases.openstack.org/constraints/upper/master' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **CNI Daemon Mode**: \`${{ inputs.cni_daemon || 'True' }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Oslo Lock Path**: \`/var/kuryr-lock\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Trigger**: \`${{ github.event_name }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
