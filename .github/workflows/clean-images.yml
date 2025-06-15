@@ -1,0 +1,87 @@
+name: Clean Docker Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Preview only, do not actually delete'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    # Auto cleanup every Sunday at 2 AM
+    - cron: '0 2 * * 0'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: kuryr-kubernetes
+  OWNER: ${{ github.repository_owner }}
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: |
+          pip install requests
+
+      - name: Create github.json config
+        run: |
+          cat > github.json << EOF
+          {
+            "token": "${{ secrets.GITHUB_TOKEN }}",
+            "username": "${{ github.repository_owner }}",
+            "is_org": false,
+            "packages": [
+              "kuryr-kubernetes-cni",
+              "kuryr-kubernetes-controller"
+            ]
+          }
+          EOF
+
+      - name: Run cleanup script
+        id: cleanup-script
+        run: |
+          python cleanup-github.py
+
+      - name: Cleanup config file
+        if: always()
+        run: |
+          rm -f github.json
+
+      - name: Generate summary report
+        if: always()
+        run: |
+          echo "## 🗑️ Docker Image Cleanup Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🎯 Target Packages" >> $GITHUB_STEP_SUMMARY
+          echo "- kuryr-kubernetes-cni" >> $GITHUB_STEP_SUMMARY
+          echo "- kuryr-kubernetes-controller" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📊 Results" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.cleanup-script.outcome }}" == "success" ]; then
+            echo "✅ Cleanup completed successfully" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Cleanup failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Trigger**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Check cleanup result
+        if: always()
+        run: |
+          if [ "${{ steps.cleanup-script.outcome }}" != "success" ]; then
+            echo "Cleanup script execution failed!"
+            exit 1
+          fi

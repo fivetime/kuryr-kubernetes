@@ -1,0 +1,208 @@
+name: Build Docker Images
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'cni.Dockerfile'
+      - 'controller.Dockerfile'
+      - '.github/workflows/build-images.yml'
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'cni.Dockerfile'
+      - 'controller.Dockerfile'
+      - '.github/workflows/build-images.yml'
+  workflow_dispatch:
+    inputs:
+      upper_constraints_file:
+        description: 'OpenStack upper constraints file URL'
+        required: false
+        default: 'https://releases.openstack.org/constraints/upper/master'
+      cni_daemon:
+        description: 'Enable CNI daemon mode'
+        required: false
+        default: 'True'
+        type: choice
+        options:
+          - 'True'
+          - 'False'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: kuryr-kubernetes
+  OWNER: ${{ github.repository_owner }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      matrix:
+        image: [cni, controller]
+        include:
+          - image: cni
+            dockerfile: cni.Dockerfile
+            context: .
+          - image: controller
+            dockerfile: controller.Dockerfile
+            context: .
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.CR_PAT }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.IMAGE_PREFIX }}-${{ matrix.image }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix={{branch}}-
+
+      - name: Prepare build args
+        id: build-args
+        run: |
+          echo "UPPER_CONSTRAINTS_FILE=${{ inputs.upper_constraints_file || 'https://releases.openstack.org/constraints/upper/master' }}" >> $GITHUB_OUTPUT
+          echo "OSLO_LOCK_PATH=/var/kuryr-lock" >> $GITHUB_OUTPUT
+          
+          # 只为 CNI 镜像设置 CNI_DAEMON 参数
+          if [ "${{ matrix.image }}" = "cni" ]; then
+            echo "CNI_DAEMON=${{ inputs.cni_daemon || 'True' }}" >> $GITHUB_OUTPUT
+            echo "EXTRA_ARGS=CNI_DAEMON=${{ inputs.cni_daemon || 'True' }}" >> $GITHUB_OUTPUT
+          else
+            echo "EXTRA_ARGS=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            UPPER_CONSTRAINTS_FILE=${{ steps.build-args.outputs.UPPER_CONSTRAINTS_FILE }}
+            OSLO_LOCK_PATH=${{ steps.build-args.outputs.OSLO_LOCK_PATH }}
+            ${{ steps.build-args.outputs.EXTRA_ARGS }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          platforms: linux/amd64
+
+      - name: Test image
+        run: |
+          # 获取主要镜像标签
+          MAIN_IMAGE="${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.IMAGE_PREFIX }}-${{ matrix.image }}"
+          
+          # 确定测试标签
+          if [[ "${{ github.event_name }}" == "push" && ("${{ github.ref_name }}" == "main" || "${{ github.ref_name }}" == "master") ]]; then
+            TEST_TAG="$MAIN_IMAGE:latest"
+          elif [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            TEST_TAG="$MAIN_IMAGE:pr-${{ github.event.number }}"
+          else
+            TEST_TAG="$MAIN_IMAGE:${{ github.ref_name }}"
+          fi
+          
+          echo "Testing image: $TEST_TAG"
+          
+          # 基础测试 - 验证 Python 环境
+          echo "Verifying Python environment..."
+          docker run --rm $TEST_TAG python3 --version
+          
+          # 特定组件测试
+          if [ "${{ matrix.image }}" = "cni" ]; then
+            echo "Testing CNI component..."
+          
+            # 测试 CNI 二进制文件
+            echo "Checking CNI binary..."
+            docker run --rm $TEST_TAG ls -la /kuryr-cni
+          
+            # 测试配置目录
+            echo "Checking config directory..."
+            docker run --rm $TEST_TAG ls -la /etc/kuryr-cni
+          
+            # 测试初始化脚本
+            echo "Checking init script..."
+            docker run --rm $TEST_TAG which cni_ds_init
+          
+            # 测试环境变量
+            echo "Checking environment variables..."
+            docker run --rm $TEST_TAG printenv | grep -E "(CNI_DAEMON|OSLO_LOCK_PATH)"
+          
+          elif [ "${{ matrix.image }}" = "controller" ]; then
+            echo "Testing Controller component..."
+          
+            # 测试控制器帮助信息
+            echo "Checking controller command..."
+            docker run --rm $TEST_TAG kuryr-k8s-controller --help | head -10
+          
+            # 验证 kuryr 用户
+            echo "Checking kuryr user..."
+            docker run --rm $TEST_TAG id kuryr
+          
+            # 检查 Python 包安装
+            echo "Checking Python packages..."
+            docker run --rm $TEST_TAG python3 -c "import kuryr_kubernetes; print('Kuryr Kubernetes imported successfully')"
+          fi
+          
+          echo "✅ Image ${{ matrix.image }} test passed"
+
+  summary:
+    runs-on: ubuntu-latest
+    needs: build
+    if: always()
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## 🐳 Kuryr Kubernetes Docker Images Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📊 Build Status" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ needs.build.result }}" == "success" ]; then
+            echo "| kuryr-kubernetes-cni | ✅ Success |" >> $GITHUB_STEP_SUMMARY
+            echo "| kuryr-kubernetes-controller | ✅ Success |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| kuryr-kubernetes-cni | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+            echo "| kuryr-kubernetes-controller | ❌ Failed |" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🏷️ Available Images" >> $GITHUB_STEP_SUMMARY
+          echo "**GitHub Container Registry:**" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.IMAGE_PREFIX }}-cni:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`${{ env.REGISTRY }}/${{ env.OWNER }}/${{ env.IMAGE_PREFIX }}-controller:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔧 Local Build Commands" >> $GITHUB_STEP_SUMMARY
+          echo "To build locally with official names:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "docker build -t kuryr/controller -f controller.Dockerfile ." >> $GITHUB_STEP_SUMMARY
+          echo "docker build -t kuryr/cni -f cni.Dockerfile ." >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ⚙️ Build Parameters" >> $GITHUB_STEP_SUMMARY
+          echo "- **Upper Constraints**: \`${{ inputs.upper_constraints_file || 'https://releases.openstack.org/constraints/upper/master' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **CNI Daemon Mode**: \`${{ inputs.cni_daemon || 'True' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Oslo Lock Path**: \`/var/kuryr-lock\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger**: \`${{ github.event_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📖 Official Documentation" >> $GITHUB_STEP_SUMMARY
+          echo "Build commands follow [Kuryr Official Documentation](https://docs.openstack.org/kuryr-kubernetes/latest/installation/containerized.html#building-images)" >> $GITHUB_STEP_SUMMARY
